@@ -15,8 +15,7 @@ import {
 import {
   runClean,
   setCleanProgressCallback,
-  generateElevatedCleanScript,
-  getElevatedPaths
+  generateElevatedCleanScript
 } from './cleaner'
 import type { ScanItem, CleanResult, ScanCategory } from './types'
 
@@ -131,43 +130,37 @@ function setupIpcHandlers(): void {
       mainWindow?.webContents.send('clean:progress', progress)
     })
 
-    const result = await runClean(itemsToClean)
-    mainWindow?.webContents.send('clean:done', result)
-    return result
-  })
+    const normalItems = itemsToClean.filter((item) => !item.needsElevation)
+    const elevatedItems = itemsToClean.filter((item) => item.needsElevation)
 
-  ipcMain.handle('clean:elevated', async (_event, filePaths: string[], allFiles: boolean) => {
-    const itemsToClean: ScanItem[] = []
+    const normalResult = normalItems.length > 0 ? await runClean(normalItems) : {
+      success: true,
+      totalFreed: 0,
+      cleanedCount: 0,
+      failedCount: 0,
+      failedItems: []
+    } as CleanResult
 
-    if (allFiles) {
-      for (const subMap of currentScanResults.values()) {
-        for (const items of subMap.values()) {
-          itemsToClean.push(...items)
-        }
-      }
-    } else {
-      const pathSet = new Set(filePaths)
-      for (const subMap of currentScanResults.values()) {
-        for (const items of subMap.values()) {
-          for (const item of items) {
-            if (pathSet.has(item.path)) {
-              itemsToClean.push(item)
-            }
-          }
-        }
-      }
-    }
-
-    const elevatedItems = getElevatedPaths(itemsToClean)
     if (elevatedItems.length === 0) {
-      return {
-        success: true,
-        totalFreed: 0,
-        cleanedCount: 0,
-        failedCount: 0,
-        failedItems: []
-      } as CleanResult
+      mainWindow?.webContents.send('clean:done', normalResult)
+      return normalResult
     }
+
+    const totalCount = normalItems.length + elevatedItems.length
+    const baseProgress = Math.floor((normalItems.length / totalCount) * 90)
+
+    const reportProgress = (text: string, percent: number): void => {
+      mainWindow?.webContents.send('clean:progress', {
+        current: text,
+        percent: baseProgress + Math.floor(percent * 0.1),
+        cleaned: normalResult.cleanedCount,
+        total: totalCount,
+        freed: normalResult.totalFreed,
+        failed: normalResult.failedItems
+      })
+    }
+
+    reportProgress('正在请求管理员权限...', 0)
 
     const script = generateElevatedCleanScript(elevatedItems)
     const tempScriptPath = join(os.tmpdir(), `pc-cleaner-${Date.now()}.ps1`)
@@ -176,19 +169,38 @@ function setupIpcHandlers(): void {
       fs.writeFileSync(tempScriptPath, script, 'utf-8')
     } catch (err) {
       dialog.showErrorBox('错误', `无法创建临时脚本: ${err}`)
-      return {
+      const finalResult: CleanResult = {
         success: false,
-        totalFreed: 0,
-        cleanedCount: 0,
-        failedCount: elevatedItems.length,
-        failedItems: elevatedItems.map((i) => i.path)
-      } as CleanResult
+        totalFreed: normalResult.totalFreed,
+        cleanedCount: normalResult.cleanedCount,
+        failedCount: normalResult.failedCount + elevatedItems.length,
+        failedItems: [...normalResult.failedItems, ...elevatedItems.map((i) => i.path)]
+      }
+      mainWindow?.webContents.send('clean:progress', {
+        current: '清理完成',
+        percent: 100,
+        cleaned: finalResult.cleanedCount,
+        total: totalCount,
+        freed: finalResult.totalFreed,
+        failed: finalResult.failedItems
+      })
+      mainWindow?.webContents.send('clean:done', finalResult)
+      return finalResult
     }
 
-    return new Promise<CleanResult>((resolve) => {
+    const elevatedResult: CleanResult = await new Promise((resolve) => {
       const command = `powershell -ExecutionPolicy Bypass -File "${tempScriptPath}"`
 
+      let progressInterval: ReturnType<typeof setInterval> | null = null
+      let simulatedPercent = 0
+
+      progressInterval = setInterval(() => {
+        simulatedPercent = Math.min(simulatedPercent + 2, 95)
+        reportProgress(`正在以管理员权限清理系统文件... (${simulatedPercent}%)`, simulatedPercent)
+      }, 500)
+
       sudo.exec(command, { name: 'PC Deep Cleaner' }, (error, stdout, stderr) => {
+        if (progressInterval) clearInterval(progressInterval)
         try {
           fs.unlinkSync(tempScriptPath)
         } catch {
@@ -198,7 +210,7 @@ function setupIpcHandlers(): void {
         if (error) {
           dialog.showErrorBox(
             '权限提升失败',
-            `无法以管理员权限执行清理操作: ${error.message}\n请手动以管理员身份运行本程序。`
+            `无法以管理员权限执行清理操作: ${error.message}\n未获得权限的文件将保留，您可以手动以管理员身份重新运行程序。`
           )
           resolve({
             success: false,
@@ -216,17 +228,58 @@ function setupIpcHandlers(): void {
         const failedLines = output
           .split('\n')
           .filter((line) => line.startsWith('FAILED:'))
-          .map((line) => line.replace('FAILED: ', '').split(' - ')[0])
+          .map((line) => line.replace('FAILED: ', '').split(' - ')[0].trim())
+
+        let estimatedFreed = 0
+        const deletedPaths = output
+          .split('\n')
+          .filter((line) => line.startsWith('DELETED:'))
+          .map((line) => line.replace('DELETED: ', '').trim())
+
+        for (const item of elevatedItems) {
+          if (deletedPaths.some((p) => item.path.startsWith(p) || p.startsWith(item.path))) {
+            estimatedFreed += item.size
+          }
+        }
 
         resolve({
           success: failed === 0,
-          totalFreed: 0,
+          totalFreed: estimatedFreed,
           cleanedCount: deleted,
           failedCount: failed,
           failedItems: failedLines
         })
       })
     })
+
+    const finalResult: CleanResult = {
+      success: normalResult.success && elevatedResult.success,
+      totalFreed: normalResult.totalFreed + elevatedResult.totalFreed,
+      cleanedCount: normalResult.cleanedCount + elevatedResult.cleanedCount,
+      failedCount: normalResult.failedCount + elevatedResult.failedCount,
+      failedItems: [...normalResult.failedItems, ...elevatedResult.failedItems]
+    }
+
+    mainWindow?.webContents.send('clean:progress', {
+      current: '清理完成',
+      percent: 100,
+      cleaned: finalResult.cleanedCount,
+      total: totalCount,
+      freed: finalResult.totalFreed,
+      failed: finalResult.failedItems
+    })
+    mainWindow?.webContents.send('clean:done', finalResult)
+    return finalResult
+  })
+
+  ipcMain.handle('clean:elevated', async (_event, _filePaths: string[], _allFiles: boolean) => {
+    return {
+      success: true,
+      totalFreed: 0,
+      cleanedCount: 0,
+      failedCount: 0,
+      failedItems: []
+    } as CleanResult
   })
 }
 

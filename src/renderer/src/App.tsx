@@ -202,10 +202,6 @@ const App: React.FC = () => {
     setCleanProgress({ current: '准备清理...', percent: 0, cleaned: 0, total: selectedItems.size, freed: 0, failed: [] })
 
     try {
-      const elevated = hasElevatedItems()
-      if (elevated) {
-        await window.api.cleanElevated([...selectedItems], false)
-      }
       const result = await window.api.cleanStart([...selectedItems], false)
       setCleanResult(result)
       setShowResult(true)

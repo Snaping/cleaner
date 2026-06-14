@@ -33,7 +33,10 @@ const FileList: React.FC<FileListProps> = ({
     )
   }
 
-  const activeSub = activeCat.subCategories.find((s) => s.id === activeSubCategory)
+  const firstSubWithItems = activeCat.subCategories.find((s) => s.items.length > 0)
+  const actualActiveSub = activeCat.subCategories.find((s) => s.id === activeSubCategory)
+  const displaySubCategory = actualActiveSub || firstSubWithItems || activeCat.subCategories[0]
+  const activeSub = (actualActiveSub && actualActiveSub.items.length > 0) ? actualActiveSub : null
   const hasItems = activeCat.subCategories.some((s) => s.items.length > 0)
 
   if (!hasItems) {
@@ -75,7 +78,7 @@ const FileList: React.FC<FileListProps> = ({
     return selected > 0 && selected < sub.items.length
   }
 
-  const currentSub = activeSub || activeCat.subCategories.find((s) => s.items.length > 0)
+  const currentSub = displaySubCategory
 
   return (
     <div className="file-list-area">
