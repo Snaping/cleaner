@@ -182,13 +182,20 @@ const App: React.FC = () => {
     })
   }
 
-  const handleSelectAll = (): void => {
-    const allPaths = getAllItems().map((item) => item.path)
-    setSelectedItems(new Set(allPaths))
+  const handleToggleSelectAll = (): void => {
+    const allItems = getAllItems()
+    const allSelected = allItems.length > 0 && allItems.every((item) => selectedItems.has(item.path))
+    if (allSelected) {
+      setSelectedItems(new Set())
+    } else {
+      const allPaths = allItems.map((item) => item.path)
+      setSelectedItems(new Set(allPaths))
+    }
   }
 
-  const handleDeselectAll = (): void => {
-    setSelectedItems(new Set())
+  const isAllSelected = (): boolean => {
+    const allItems = getAllItems()
+    return allItems.length > 0 && allItems.every((item) => selectedItems.has(item.path))
   }
 
   const handleCleanClick = (): void => {
@@ -213,7 +220,8 @@ const App: React.FC = () => {
   }
 
   const handleCleanAll = (): void => {
-    handleSelectAll()
+    const allPaths = getAllItems().map((item) => item.path)
+    setSelectedItems(new Set(allPaths))
     setTimeout(() => handleCleanClick(), 50)
   }
 
@@ -282,15 +290,11 @@ const App: React.FC = () => {
             </div>
 
             <div className="toolbar-actions">
-              {status === 'scanned' && (
-                <>
-                  <button className="btn btn-secondary" onClick={handleSelectAll}>
-                    <span className="btn-icon">☑️</span>全选
-                  </button>
-                  <button className="btn btn-secondary" onClick={handleDeselectAll}>
-                    <span className="btn-icon">⬜</span>取消全选
-                  </button>
-                </>
+              {status === 'scanned' && getTotalItems() > 0 && (
+                <button className="btn btn-secondary" onClick={handleToggleSelectAll}>
+                  <span className="btn-icon">{isAllSelected() ? '☑️' : '⬜'}</span>
+                  {isAllSelected() ? '取消全选' : '全选'}
+                </button>
               )}
               {(status === 'idle' || status === 'scanned' || status === 'done') && (
                 <button

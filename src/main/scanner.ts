@@ -11,6 +11,8 @@ const WINDIR = process.env.WINDIR || 'C:\\Windows'
 const PROGRAMFILES = process.env.ProgramFiles || 'C:\\Program Files'
 const PROGRAMFILES_X86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)'
 
+const YIELD_INTERVAL = 50
+
 let progressCallback: ((progress: ScanProgress) => void) | null = null
 let isCancelled = false
 
@@ -26,6 +28,10 @@ function reportProgress(current: string, percent: number, scanned: number, found
   if (progressCallback) {
     progressCallback({ current, percent, scanned, found })
   }
+}
+
+function yieldEventLoop(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve))
 }
 
 function safeReaddir(dirPath: string): string[] {
@@ -44,7 +50,7 @@ function safeStat(filePath: string): fs.Stats | null {
   }
 }
 
-function getDirectorySize(dirPath: string): number {
+function getDirectorySizeSync(dirPath: string): number {
   if (!fs.existsSync(dirPath)) return 0
   try {
     const stat = safeStat(dirPath)
@@ -58,7 +64,7 @@ function getDirectorySize(dirPath: string): number {
         const s = safeStat(full)
         if (s) {
           if (s.isDirectory()) {
-            size += getDirectorySize(full)
+            size += getDirectorySizeSync(full)
           } else {
             size += s.size
           }
@@ -92,7 +98,7 @@ function createItem(
 ): ScanItem {
   return {
     path: filePath,
-    size: stat.isDirectory() ? getDirectorySize(filePath) : stat.size,
+    size: stat.isDirectory() ? getDirectorySizeSync(filePath) : stat.size,
     lastModified: stat.mtime,
     reason,
     needsElevation: pathNeedsElevation(filePath),
@@ -101,7 +107,7 @@ function createItem(
   }
 }
 
-function scanDirectoryForFiles(
+async function scanDirectoryForFilesAsync(
   dirPath: string,
   extensions: string[],
   category: string,
@@ -110,8 +116,9 @@ function scanDirectoryForFiles(
   maxDepth: number = 5,
   currentDepth: number = 0,
   scanned: { count: number },
-  found: { count: number }
-): ScanItem[] {
+  found: { count: number },
+  yieldCounter: { count: number }
+): Promise<ScanItem[]> {
   if (isCancelled) return []
   const results: ScanItem[] = []
   if (!fs.existsSync(dirPath) || currentDepth > maxDepth) return results
@@ -125,13 +132,17 @@ function scanDirectoryForFiles(
       if (!stat) continue
 
       scanned.count++
-      if (scanned.count % 100 === 0) {
+      yieldCounter.count++
+
+      if (yieldCounter.count >= YIELD_INTERVAL) {
+        yieldCounter.count = 0
         reportProgress(full, 0, scanned.count, found.count)
+        await yieldEventLoop()
       }
 
       if (stat.isDirectory()) {
         results.push(
-          ...scanDirectoryForFiles(
+          ...(await scanDirectoryForFilesAsync(
             full,
             extensions,
             category,
@@ -140,8 +151,9 @@ function scanDirectoryForFiles(
             maxDepth,
             currentDepth + 1,
             scanned,
-            found
-          )
+            found,
+            yieldCounter
+          ))
         )
       } else {
         const ext = path.extname(entry).toLowerCase()
@@ -157,7 +169,7 @@ function scanDirectoryForFiles(
   return results
 }
 
-function scanDirectoryPatterns(
+async function scanDirectoryPatternsAsync(
   basePath: string,
   patterns: string[],
   category: string,
@@ -165,8 +177,9 @@ function scanDirectoryPatterns(
   reason: string,
   matchDirectories: boolean = true,
   scanned: { count: number },
-  found: { count: number }
-): ScanItem[] {
+  found: { count: number },
+  yieldCounter: { count: number }
+): Promise<ScanItem[]> {
   if (isCancelled) return []
   const results: ScanItem[] = []
   if (!fs.existsSync(basePath)) return results
@@ -180,8 +193,12 @@ function scanDirectoryPatterns(
       if (!stat) continue
 
       scanned.count++
-      if (scanned.count % 100 === 0) {
+      yieldCounter.count++
+
+      if (yieldCounter.count >= YIELD_INTERVAL) {
+        yieldCounter.count = 0
         reportProgress(full, 0, scanned.count, found.count)
+        await yieldEventLoop()
       }
 
       const lowerEntry = entry.toLowerCase()
@@ -197,7 +214,17 @@ function scanDirectoryPatterns(
         }
       } else if (stat.isDirectory()) {
         results.push(
-          ...scanDirectoryPatterns(full, patterns, category, subCategory, reason, matchDirectories, scanned, found)
+          ...(await scanDirectoryPatternsAsync(
+            full,
+            patterns,
+            category,
+            subCategory,
+            reason,
+            matchDirectories,
+            scanned,
+            found,
+            yieldCounter
+          ))
         )
       }
     } catch {
@@ -207,55 +234,63 @@ function scanDirectoryPatterns(
   return results
 }
 
-function addExistingDirectory(
+function addExistingDirectorySync(
   dirPath: string,
   category: string,
   subCategory: string,
-  reason: string
+  reason: string,
+  found: { count: number }
 ): ScanItem[] {
   if (fs.existsSync(dirPath)) {
     const stat = safeStat(dirPath)
     if (stat) {
+      found.count++
       return [createItem(dirPath, stat, reason, category, subCategory)]
     }
   }
   return []
 }
 
-interface ScanTask {
+interface AsyncScanTask {
   category: string
   subCategory: string
-  scanFn: () => ScanItem[]
   description: string
+  scanFn: () => Promise<ScanItem[]>
 }
 
-function buildScanTasks(): ScanTask[] {
-  const scanned = { count: 0 }
-  const found = { count: 0 }
+function buildAsyncScanTasks(scanned: { count: number }, found: { count: number }): AsyncScanTask[] {
+  const yieldCounter = { count: 0 }
 
   return [
     {
       category: 'system_temp',
       subCategory: 'windows_temp',
       description: '扫描Windows临时目录...',
-      scanFn: () => {
+      scanFn: async () => {
         const tempDir = path.join(WINDIR, 'Temp')
         const items: ScanItem[] = []
         if (fs.existsSync(tempDir)) {
           const entries = safeReaddir(tempDir)
-          for (const entry of entries) {
+          for (let i = 0; i < entries.length; i++) {
             if (isCancelled) break
+            const entry = entries[i]
+            const full = path.join(tempDir, entry)
             try {
-              const full = path.join(tempDir, entry)
               const stat = safeStat(full)
               if (stat) {
                 items.push(createItem(full, stat, 'Windows系统临时文件', 'system_temp', 'windows_temp'))
                 found.count++
               }
             } catch {
-              continue
+              // continue
             }
             scanned.count++
+            yieldCounter.count++
+            if (yieldCounter.count >= YIELD_INTERVAL) {
+              yieldCounter.count = 0
+              reportProgress(full, 0, scanned.count, found.count)
+              await yieldEventLoop()
+            }
           }
         }
         return items
@@ -265,24 +300,31 @@ function buildScanTasks(): ScanTask[] {
       category: 'system_temp',
       subCategory: 'user_temp',
       description: '扫描用户临时目录...',
-      scanFn: () => {
+      scanFn: async () => {
         const tempDir = process.env.TEMP || process.env.TMP || path.join(LOCALAPPDATA, 'Temp')
         const items: ScanItem[] = []
         if (fs.existsSync(tempDir)) {
           const entries = safeReaddir(tempDir)
-          for (const entry of entries) {
+          for (let i = 0; i < entries.length; i++) {
             if (isCancelled) break
+            const entry = entries[i]
+            const full = path.join(tempDir, entry)
             try {
-              const full = path.join(tempDir, entry)
               const stat = safeStat(full)
               if (stat) {
                 items.push(createItem(full, stat, '用户临时文件', 'system_temp', 'user_temp'))
                 found.count++
               }
             } catch {
-              continue
+              // continue
             }
             scanned.count++
+            yieldCounter.count++
+            if (yieldCounter.count >= YIELD_INTERVAL) {
+              yieldCounter.count = 0
+              reportProgress(full, 0, scanned.count, found.count)
+              await yieldEventLoop()
+            }
           }
         }
         return items
@@ -292,9 +334,9 @@ function buildScanTasks(): ScanTask[] {
       category: 'system_temp',
       subCategory: 'prefetch',
       description: '扫描预读取文件...',
-      scanFn: () => {
+      scanFn: async () => {
         const prefetchDir = path.join(WINDIR, 'Prefetch')
-        return scanDirectoryForFiles(
+        return scanDirectoryForFilesAsync(
           prefetchDir,
           ['.pf'],
           'system_temp',
@@ -303,7 +345,8 @@ function buildScanTasks(): ScanTask[] {
           1,
           0,
           scanned,
-          found
+          found,
+          yieldCounter
         )
       }
     },
@@ -311,9 +354,9 @@ function buildScanTasks(): ScanTask[] {
       category: 'system_temp',
       subCategory: 'thumbnails',
       description: '扫描缩略图缓存...',
-      scanFn: () => {
+      scanFn: async () => {
         const thumbDir = path.join(LOCALAPPDATA, 'Microsoft', 'Windows', 'Explorer')
-        return scanDirectoryForFiles(
+        return scanDirectoryForFilesAsync(
           thumbDir,
           ['.db'],
           'system_temp',
@@ -322,7 +365,8 @@ function buildScanTasks(): ScanTask[] {
           2,
           0,
           scanned,
-          found
+          found,
+          yieldCounter
         )
       }
     },
@@ -330,7 +374,7 @@ function buildScanTasks(): ScanTask[] {
       category: 'system_temp',
       subCategory: 'memory_dump',
       description: '扫描内存转储文件...',
-      scanFn: () => {
+      scanFn: async () => {
         const items: ScanItem[] = []
         const dumpPaths = [
           path.join(WINDIR, 'MEMORY.DMP'),
@@ -338,9 +382,8 @@ function buildScanTasks(): ScanTask[] {
           path.join(LOCALAPPDATA, 'CrashDumps')
         ]
         for (const p of dumpPaths) {
-          items.push(...addExistingDirectory(p, 'system_temp', 'memory_dump', '内存转储/崩溃转储文件'))
+          items.push(...addExistingDirectorySync(p, 'system_temp', 'memory_dump', '内存转储/崩溃转储文件', found))
         }
-        found.count += items.length
         return items
       }
     },
@@ -348,7 +391,7 @@ function buildScanTasks(): ScanTask[] {
       category: 'system_temp',
       subCategory: 'system_logs',
       description: '扫描系统日志文件...',
-      scanFn: () => {
+      scanFn: async () => {
         const logPaths = [
           path.join(WINDIR, 'Logs'),
           path.join(WINDIR, 'System32', 'LogFiles'),
@@ -358,8 +401,20 @@ function buildScanTasks(): ScanTask[] {
         let items: ScanItem[] = []
         for (const p of logPaths) {
           items = items.concat(
-            scanDirectoryForFiles(p, ['.log', '.etl', '.evt', '.evtx'], 'system_temp', 'system_logs', '系统日志文件', 4, 0, scanned, found)
+            await scanDirectoryForFilesAsync(
+              p,
+              ['.log', '.etl', '.evt', '.evtx'],
+              'system_temp',
+              'system_logs',
+              '系统日志文件',
+              4,
+              0,
+              scanned,
+              found,
+              yieldCounter
+            )
           )
+          await yieldEventLoop()
         }
         return items
       }
@@ -368,9 +423,9 @@ function buildScanTasks(): ScanTask[] {
       category: 'system_temp',
       subCategory: 'winsxs_backup',
       description: '扫描WinSxS备份...',
-      scanFn: () => {
+      scanFn: async () => {
         const winsxsDir = path.join(WINDIR, 'WinSxS')
-        return scanDirectoryPatterns(
+        return scanDirectoryPatternsAsync(
           winsxsDir,
           ['backup', 'temp'],
           'system_temp',
@@ -378,7 +433,8 @@ function buildScanTasks(): ScanTask[] {
           'WinSxS组件备份文件',
           true,
           scanned,
-          found
+          found,
+          yieldCounter
         )
       }
     },
@@ -386,30 +442,35 @@ function buildScanTasks(): ScanTask[] {
       category: 'appdata_cache',
       subCategory: 'appdata_local_temp',
       description: '扫描AppData本地临时文件...',
-      scanFn: () => {
-        const localDirs = [
-          path.join(LOCALAPPDATA, 'Temp'),
-          path.join(LOCALAPPDATA, 'CrashDumps')
-        ]
-        let items: ScanItem[] = []
+      scanFn: async () => {
+        const localDirs = [path.join(LOCALAPPDATA, 'Temp'), path.join(LOCALAPPDATA, 'CrashDumps')]
+        const items: ScanItem[] = []
         for (const d of localDirs) {
           if (fs.existsSync(d)) {
             const entries = safeReaddir(d)
-            for (const entry of entries) {
+            for (let i = 0; i < entries.length; i++) {
               if (isCancelled) break
+              const entry = entries[i]
+              const full = path.join(d, entry)
               try {
-                const full = path.join(d, entry)
                 const stat = safeStat(full)
                 if (stat) {
                   items.push(createItem(full, stat, 'AppData本地临时文件', 'appdata_cache', 'appdata_local_temp'))
                   found.count++
                 }
               } catch {
-                continue
+                // continue
               }
               scanned.count++
+              yieldCounter.count++
+              if (yieldCounter.count >= YIELD_INTERVAL) {
+                yieldCounter.count = 0
+                reportProgress(full, 0, scanned.count, found.count)
+                await yieldEventLoop()
+              }
             }
           }
+          await yieldEventLoop()
         }
         return items
       }
@@ -418,9 +479,9 @@ function buildScanTasks(): ScanTask[] {
       category: 'appdata_cache',
       subCategory: 'appdata_roaming_cache',
       description: '扫描漫游应用缓存...',
-      scanFn: () => {
+      scanFn: async () => {
         const cachePatterns = ['cache', 'caches', 'temp']
-        return scanDirectoryPatterns(
+        return scanDirectoryPatternsAsync(
           APPDATA,
           cachePatterns,
           'appdata_cache',
@@ -428,7 +489,8 @@ function buildScanTasks(): ScanTask[] {
           '漫游应用程序缓存',
           true,
           scanned,
-          found
+          found,
+          yieldCounter
         )
       }
     },
@@ -436,18 +498,17 @@ function buildScanTasks(): ScanTask[] {
       category: 'appdata_cache',
       subCategory: 'crash_reports',
       description: '扫描崩溃报告...',
-      scanFn: () => {
+      scanFn: async () => {
         const crashDirs = [
           path.join(APPDATA, 'Microsoft', 'Windows', 'WER', 'ReportArchive'),
           path.join(APPDATA, 'Microsoft', 'Windows', 'WER', 'ReportQueue'),
           path.join(LOCALAPPDATA, 'Microsoft', 'Windows', 'WER', 'ReportArchive'),
           path.join(LOCALAPPDATA, 'Microsoft', 'Windows', 'WER', 'ReportQueue')
         ]
-        let items: ScanItem[] = []
+        const items: ScanItem[] = []
         for (const d of crashDirs) {
-          items.push(...addExistingDirectory(d, 'appdata_cache', 'crash_reports', '应用程序崩溃报告'))
+          items.push(...addExistingDirectorySync(d, 'appdata_cache', 'crash_reports', '应用程序崩溃报告', found))
         }
-        found.count += items.length
         return items
       }
     },
@@ -455,7 +516,7 @@ function buildScanTasks(): ScanTask[] {
       category: 'appdata_cache',
       subCategory: 'browser_cache',
       description: '扫描浏览器缓存...',
-      scanFn: () => {
+      scanFn: async () => {
         const browserPaths = [
           { path: path.join(LOCALAPPDATA, 'Google', 'Chrome', 'User Data'), name: 'Chrome' },
           { path: path.join(LOCALAPPDATA, 'Microsoft', 'Edge', 'User Data'), name: 'Edge' },
@@ -467,8 +528,8 @@ function buildScanTasks(): ScanTask[] {
         const cacheDirNames = ['Cache', 'Code Cache', 'GPUCache', 'Service Worker', 'Media Cache', 'ShaderCache']
         for (const browser of browserPaths) {
           if (fs.existsSync(browser.path)) {
-            items.push(
-              ...scanDirectoryPatterns(
+            items = items.concat(
+              await scanDirectoryPatternsAsync(
                 browser.path,
                 cacheDirNames,
                 'appdata_cache',
@@ -476,10 +537,12 @@ function buildScanTasks(): ScanTask[] {
                 `${browser.name}浏览器缓存`,
                 true,
                 scanned,
-                found
+                found,
+                yieldCounter
               )
             )
           }
+          await yieldEventLoop()
         }
         return items
       }
@@ -488,29 +551,42 @@ function buildScanTasks(): ScanTask[] {
       category: 'appdata_cache',
       subCategory: 'electron_cache',
       description: '扫描Electron应用缓存...',
-      scanFn: () => {
+      scanFn: async () => {
+        const items: ScanItem[] = []
         const electronDirs = safeReaddir(APPDATA)
-        let items: ScanItem[] = []
-        for (const dir of electronDirs) {
+        for (let i = 0; i < electronDirs.length; i++) {
           if (isCancelled) break
+          const dir = electronDirs[i]
           const electronCache = path.join(APPDATA, dir, 'Cache')
           const electronCodeCache = path.join(APPDATA, dir, 'Code Cache')
           const electronGPUCache = path.join(APPDATA, dir, 'GPUCache')
           for (const cachePath of [electronCache, electronCodeCache, electronGPUCache]) {
-            items.push(...addExistingDirectory(cachePath, 'appdata_cache', 'electron_cache', 'Electron应用缓存'))
+            items.push(
+              ...addExistingDirectorySync(cachePath, 'appdata_cache', 'electron_cache', 'Electron应用缓存', found)
+            )
+          }
+          if (i % 10 === 0) {
+            reportProgress(path.join(APPDATA, dir), 0, scanned.count, found.count)
+            await yieldEventLoop()
           }
         }
         const localElectronDirs = safeReaddir(LOCALAPPDATA)
-        for (const dir of localElectronDirs) {
+        for (let i = 0; i < localElectronDirs.length; i++) {
           if (isCancelled) break
+          const dir = localElectronDirs[i]
           const electronCache = path.join(LOCALAPPDATA, dir, 'Cache')
           const electronCodeCache = path.join(LOCALAPPDATA, dir, 'Code Cache')
           const electronGPUCache = path.join(LOCALAPPDATA, dir, 'GPUCache')
           for (const cachePath of [electronCache, electronCodeCache, electronGPUCache]) {
-            items.push(...addExistingDirectory(cachePath, 'appdata_cache', 'electron_cache', 'Electron应用缓存'))
+            items.push(
+              ...addExistingDirectorySync(cachePath, 'appdata_cache', 'electron_cache', 'Electron应用缓存', found)
+            )
+          }
+          if (i % 10 === 0) {
+            reportProgress(path.join(LOCALAPPDATA, dir), 0, scanned.count, found.count)
+            await yieldEventLoop()
           }
         }
-        found.count += items.length
         return items
       }
     },
@@ -518,7 +594,7 @@ function buildScanTasks(): ScanTask[] {
       category: 'appdata_cache',
       subCategory: 'media_cache',
       description: '扫描媒体软件缓存...',
-      scanFn: () => {
+      scanFn: async () => {
         const mediaPaths = [
           path.join(APPDATA, 'Spotify', 'Storage'),
           path.join(LOCALAPPDATA, 'Spotify', 'Storage'),
@@ -526,11 +602,10 @@ function buildScanTasks(): ScanTask[] {
           path.join(LOCALAPPDATA, 'PotPlayerMini64', 'Cache'),
           path.join(APPDATA, 'NetEase', 'CloudMusic', 'Cache')
         ]
-        let items: ScanItem[] = []
+        const items: ScanItem[] = []
         for (const p of mediaPaths) {
-          items.push(...addExistingDirectory(p, 'appdata_cache', 'media_cache', '媒体软件缓存'))
+          items.push(...addExistingDirectorySync(p, 'appdata_cache', 'media_cache', '媒体软件缓存', found))
         }
-        found.count += items.length
         return items
       }
     },
@@ -538,12 +613,11 @@ function buildScanTasks(): ScanTask[] {
       category: 'package_manager',
       subCategory: 'npm_cache',
       description: '扫描NPM缓存...',
-      scanFn: () => {
+      scanFn: async () => {
         const npmCache = path.join(APPDATA, 'npm-cache')
         const npmCache2 = path.join(LOCALAPPDATA, 'npm-cache')
-        let items = addExistingDirectory(npmCache, 'package_manager', 'npm_cache', 'NPM包缓存')
-        items = items.concat(addExistingDirectory(npmCache2, 'package_manager', 'npm_cache', 'NPM包缓存'))
-        found.count += items.length
+        let items = addExistingDirectorySync(npmCache, 'package_manager', 'npm_cache', 'NPM包缓存', found)
+        items = items.concat(addExistingDirectorySync(npmCache2, 'package_manager', 'npm_cache', 'NPM包缓存', found))
         return items
       }
     },
@@ -551,12 +625,11 @@ function buildScanTasks(): ScanTask[] {
       category: 'package_manager',
       subCategory: 'yarn_cache',
       description: '扫描Yarn缓存...',
-      scanFn: () => {
+      scanFn: async () => {
         const yarnCache = path.join(LOCALAPPDATA, 'Yarn', 'Cache')
         const yarnCache2 = path.join(APPDATA, 'Yarn', 'Cache')
-        let items = addExistingDirectory(yarnCache, 'package_manager', 'yarn_cache', 'Yarn包缓存')
-        items = items.concat(addExistingDirectory(yarnCache2, 'package_manager', 'yarn_cache', 'Yarn包缓存'))
-        found.count += items.length
+        let items = addExistingDirectorySync(yarnCache, 'package_manager', 'yarn_cache', 'Yarn包缓存', found)
+        items = items.concat(addExistingDirectorySync(yarnCache2, 'package_manager', 'yarn_cache', 'Yarn包缓存', found))
         return items
       }
     },
@@ -564,12 +637,11 @@ function buildScanTasks(): ScanTask[] {
       category: 'package_manager',
       subCategory: 'pip_cache',
       description: '扫描Pip缓存...',
-      scanFn: () => {
+      scanFn: async () => {
         const pipCache = path.join(LOCALAPPDATA, 'pip', 'Cache')
         const pipCache2 = path.join(HOME, 'pip', 'cache')
-        let items = addExistingDirectory(pipCache, 'package_manager', 'pip_cache', 'Python Pip缓存')
-        items = items.concat(addExistingDirectory(pipCache2, 'package_manager', 'pip_cache', 'Python Pip缓存'))
-        found.count += items.length
+        let items = addExistingDirectorySync(pipCache, 'package_manager', 'pip_cache', 'Python Pip缓存', found)
+        items = items.concat(addExistingDirectorySync(pipCache2, 'package_manager', 'pip_cache', 'Python Pip缓存', found))
         return items
       }
     },
@@ -577,14 +649,17 @@ function buildScanTasks(): ScanTask[] {
       category: 'package_manager',
       subCategory: 'nuget_cache',
       description: '扫描NuGet缓存...',
-      scanFn: () => {
+      scanFn: async () => {
         const nugetCache = path.join(LOCALAPPDATA, 'NuGet', 'v3-cache')
         const nugetPackages = path.join(HOME, '.nuget', 'packages')
         const nugetPlugins = path.join(APPDATA, 'NuGet', 'plugins-cache')
-        let items = addExistingDirectory(nugetCache, 'package_manager', 'nuget_cache', 'NuGet包缓存')
-        items = items.concat(addExistingDirectory(nugetPackages, 'package_manager', 'nuget_cache', 'NuGet全局包缓存'))
-        items = items.concat(addExistingDirectory(nugetPlugins, 'package_manager', 'nuget_cache', 'NuGet插件缓存'))
-        found.count += items.length
+        let items = addExistingDirectorySync(nugetCache, 'package_manager', 'nuget_cache', 'NuGet包缓存', found)
+        items = items.concat(
+          addExistingDirectorySync(nugetPackages, 'package_manager', 'nuget_cache', 'NuGet全局包缓存', found)
+        )
+        items = items.concat(
+          addExistingDirectorySync(nugetPlugins, 'package_manager', 'nuget_cache', 'NuGet插件缓存', found)
+        )
         return items
       }
     },
@@ -592,25 +667,26 @@ function buildScanTasks(): ScanTask[] {
       category: 'package_manager',
       subCategory: 'maven_cache',
       description: '扫描Maven缓存...',
-      scanFn: () => {
+      scanFn: async () => {
         const mavenRepo = path.join(HOME, '.m2', 'repository')
-        const items = addExistingDirectory(mavenRepo, 'package_manager', 'maven_cache', 'Maven本地仓库缓存')
-        found.count += items.length
-        return items
+        return addExistingDirectorySync(mavenRepo, 'package_manager', 'maven_cache', 'Maven本地仓库缓存', found)
       }
     },
     {
       category: 'package_manager',
       subCategory: 'gradle_cache',
       description: '扫描Gradle缓存...',
-      scanFn: () => {
+      scanFn: async () => {
         const gradleCache = path.join(HOME, '.gradle', 'caches')
         const gradleWrapper = path.join(HOME, '.gradle', 'wrapper', 'dists')
         const gradleDaemon = path.join(HOME, '.gradle', 'daemon')
-        let items = addExistingDirectory(gradleCache, 'package_manager', 'gradle_cache', 'Gradle构建缓存')
-        items = items.concat(addExistingDirectory(gradleWrapper, 'package_manager', 'gradle_cache', 'Gradle Wrapper缓存'))
-        items = items.concat(addExistingDirectory(gradleDaemon, 'package_manager', 'gradle_cache', 'Gradle守护进程日志'))
-        found.count += items.length
+        let items = addExistingDirectorySync(gradleCache, 'package_manager', 'gradle_cache', 'Gradle构建缓存', found)
+        items = items.concat(
+          addExistingDirectorySync(gradleWrapper, 'package_manager', 'gradle_cache', 'Gradle Wrapper缓存', found)
+        )
+        items = items.concat(
+          addExistingDirectorySync(gradleDaemon, 'package_manager', 'gradle_cache', 'Gradle守护进程日志', found)
+        )
         return items
       }
     },
@@ -618,12 +694,11 @@ function buildScanTasks(): ScanTask[] {
       category: 'package_manager',
       subCategory: 'cargo_cache',
       description: '扫描Cargo缓存...',
-      scanFn: () => {
+      scanFn: async () => {
         const cargoRegistry = path.join(HOME, '.cargo', 'registry')
         const cargoGit = path.join(HOME, '.cargo', 'git')
-        let items = addExistingDirectory(cargoRegistry, 'package_manager', 'cargo_cache', 'Cargo包注册表缓存')
-        items = items.concat(addExistingDirectory(cargoGit, 'package_manager', 'cargo_cache', 'Cargo Git依赖缓存'))
-        found.count += items.length
+        let items = addExistingDirectorySync(cargoRegistry, 'package_manager', 'cargo_cache', 'Cargo包注册表缓存', found)
+        items = items.concat(addExistingDirectorySync(cargoGit, 'package_manager', 'cargo_cache', 'Cargo Git依赖缓存', found))
         return items
       }
     },
@@ -631,13 +706,12 @@ function buildScanTasks(): ScanTask[] {
       category: 'package_manager',
       subCategory: 'go_cache',
       description: '扫描Go模块缓存...',
-      scanFn: () => {
+      scanFn: async () => {
         const goPath = process.env.GOPATH || path.join(HOME, 'go')
         const goModCache = path.join(goPath, 'pkg', 'mod')
         const goBuildCache = path.join(LOCALAPPDATA, 'go-build')
-        let items = addExistingDirectory(goModCache, 'package_manager', 'go_cache', 'Go模块缓存')
-        items = items.concat(addExistingDirectory(goBuildCache, 'package_manager', 'go_cache', 'Go构建缓存'))
-        found.count += items.length
+        let items = addExistingDirectorySync(goModCache, 'package_manager', 'go_cache', 'Go模块缓存', found)
+        items = items.concat(addExistingDirectorySync(goBuildCache, 'package_manager', 'go_cache', 'Go构建缓存', found))
         return items
       }
     },
@@ -645,18 +719,16 @@ function buildScanTasks(): ScanTask[] {
       category: 'package_manager',
       subCategory: 'pnpm_store',
       description: '扫描Pnpm存储...',
-      scanFn: () => {
+      scanFn: async () => {
         const pnpmStore = path.join(LOCALAPPDATA, 'pnpm-store')
-        const items = addExistingDirectory(pnpmStore, 'package_manager', 'pnpm_store', 'Pnpm内容寻址存储')
-        found.count += items.length
-        return items
+        return addExistingDirectorySync(pnpmStore, 'package_manager', 'pnpm_store', 'Pnpm内容寻址存储', found)
       }
     },
     {
       category: 'ide_cache',
       subCategory: 'vscode_cache',
       description: '扫描VSCode缓存...',
-      scanFn: () => {
+      scanFn: async () => {
         const vscodePaths = [
           path.join(APPDATA, 'Code', 'Cache'),
           path.join(APPDATA, 'Code', 'Code Cache'),
@@ -671,11 +743,10 @@ function buildScanTasks(): ScanTask[] {
           path.join(APPDATA, 'VSCodium', 'Cache'),
           path.join(APPDATA, 'VSCodium', 'Code Cache')
         ]
-        let items: ScanItem[] = []
+        const items: ScanItem[] = []
         for (const p of vscodePaths) {
-          items.push(...addExistingDirectory(p, 'ide_cache', 'vscode_cache', 'VSCode缓存文件'))
+          items.push(...addExistingDirectorySync(p, 'ide_cache', 'vscode_cache', 'VSCode缓存文件', found))
         }
-        found.count += items.length
         return items
       }
     },
@@ -683,7 +754,7 @@ function buildScanTasks(): ScanTask[] {
       category: 'ide_cache',
       subCategory: 'vscode_extensions',
       description: '扫描废弃VSCode扩展...',
-      scanFn: () => {
+      scanFn: async () => {
         const extensionsDir = path.join(HOME, '.vscode', 'extensions')
         const items: ScanItem[] = []
         if (fs.existsSync(extensionsDir)) {
@@ -723,7 +794,7 @@ function buildScanTasks(): ScanTask[] {
       category: 'ide_cache',
       subCategory: 'vs_cache',
       description: '扫描Visual Studio缓存...',
-      scanFn: () => {
+      scanFn: async () => {
         const vsPaths = [
           path.join(LOCALAPPDATA, 'Microsoft', 'VisualStudio', 'ComponentModelCache'),
           path.join(LOCALAPPDATA, 'Microsoft', 'VisualStudio', '16.0', 'ComponentModelCache'),
@@ -731,11 +802,10 @@ function buildScanTasks(): ScanTask[] {
           path.join(LOCALAPPDATA, 'Microsoft', 'WebsiteCache'),
           path.join(APPDATA, 'Microsoft', 'VisualStudio')
         ]
-        let items: ScanItem[] = []
+        const items: ScanItem[] = []
         for (const p of vsPaths) {
-          items.push(...addExistingDirectory(p, 'ide_cache', 'vs_cache', 'Visual Studio缓存'))
+          items.push(...addExistingDirectorySync(p, 'ide_cache', 'vs_cache', 'Visual Studio缓存', found))
         }
-        found.count += items.length
         return items
       }
     },
@@ -743,19 +813,25 @@ function buildScanTasks(): ScanTask[] {
       category: 'ide_cache',
       subCategory: 'intellij_cache',
       description: '扫描JetBrains IDE缓存...',
-      scanFn: () => {
+      scanFn: async () => {
         const jetbrainsDir = path.join(APPDATA, 'JetBrains')
         const items: ScanItem[] = []
         if (fs.existsSync(jetbrainsDir)) {
           const dirs = safeReaddir(jetbrainsDir)
-          for (const dir of dirs) {
+          for (let i = 0; i < dirs.length; i++) {
             if (isCancelled) break
+            const dir = dirs[i]
             const systemCache = path.join(jetbrainsDir, dir, 'system')
-            items.push(...addExistingDirectory(systemCache, 'ide_cache', 'intellij_cache', 'JetBrains IDE系统缓存'))
+            items.push(
+              ...addExistingDirectorySync(systemCache, 'ide_cache', 'intellij_cache', 'JetBrains IDE系统缓存', found)
+            )
             scanned.count++
+            if (i % 5 === 0) {
+              reportProgress(systemCache, 0, scanned.count, found.count)
+              await yieldEventLoop()
+            }
           }
         }
-        found.count += items.length
         return items
       }
     },
@@ -763,17 +839,18 @@ function buildScanTasks(): ScanTask[] {
       category: 'system_update',
       subCategory: 'windows_update_cache',
       description: '扫描Windows更新缓存...',
-      scanFn: () => {
+      scanFn: async () => {
         const updatePaths = [
           path.join(WINDIR, 'SoftwareDistribution', 'Download'),
           path.join(WINDIR, 'SoftwareDistribution', 'DataStore'),
           path.join(WINDIR, 'SoftwareDistribution', 'PostRebootEventCache.V2')
         ]
-        let items: ScanItem[] = []
+        const items: ScanItem[] = []
         for (const p of updatePaths) {
-          items.push(...addExistingDirectory(p, 'system_update', 'windows_update_cache', 'Windows更新下载缓存'))
+          items.push(
+            ...addExistingDirectorySync(p, 'system_update', 'windows_update_cache', 'Windows更新下载缓存', found)
+          )
         }
-        found.count += items.length
         return items
       }
     },
@@ -781,18 +858,16 @@ function buildScanTasks(): ScanTask[] {
       category: 'system_update',
       subCategory: 'windows_old',
       description: '扫描Windows.old...',
-      scanFn: () => {
+      scanFn: async () => {
         const windowsOld = path.join(path.parse(WINDIR).root, 'Windows.old')
-        const items = addExistingDirectory(windowsOld, 'system_update', 'windows_old', '旧版Windows系统备份')
-        found.count += items.length
-        return items
+        return addExistingDirectorySync(windowsOld, 'system_update', 'windows_old', '旧版Windows系统备份', found)
       }
     },
     {
       category: 'system_update',
       subCategory: 'update_logs',
       description: '扫描更新日志...',
-      scanFn: () => {
+      scanFn: async () => {
         const updateLogPaths = [
           path.join(WINDIR, 'Logs', 'CBS'),
           path.join(WINDIR, 'Logs', 'DISM'),
@@ -800,14 +875,14 @@ function buildScanTasks(): ScanTask[] {
           path.join(WINDIR, 'INF', 'setupapi.setup.log'),
           path.join(WINDIR, 'Panther')
         ]
-        let items: ScanItem[] = []
+        const items: ScanItem[] = []
         for (const p of updateLogPaths) {
           const stat = safeStat(p)
           if (stat) {
             items.push(createItem(p, stat, 'Windows更新/安装日志', 'system_update', 'update_logs'))
+            found.count++
           }
         }
-        found.count += items.length
         return items
       }
     },
@@ -815,24 +890,34 @@ function buildScanTasks(): ScanTask[] {
       category: 'system_update',
       subCategory: 'delivery_optimization',
       description: '扫描传递优化文件...',
-      scanFn: () => {
+      scanFn: async () => {
         const doPath = path.join(PROGRAMDATA, 'Microsoft', 'Windows', 'DeliveryOptimization', 'Cache')
-        const items = addExistingDirectory(doPath, 'system_update', 'delivery_optimization', 'Windows传递优化缓存')
-        found.count += items.length
-        return items
+        return addExistingDirectorySync(doPath, 'system_update', 'delivery_optimization', 'Windows传递优化缓存', found)
       }
     },
     {
       category: 'program_files',
       subCategory: 'program_logs',
       description: '扫描应用程序日志...',
-      scanFn: () => {
+      scanFn: async () => {
         let items: ScanItem[] = []
         const searchPaths = [PROGRAMFILES, PROGRAMFILES_X86, PROGRAMDATA]
         for (const base of searchPaths) {
           items = items.concat(
-            scanDirectoryForFiles(base, ['.log'], 'program_files', 'program_logs', '应用程序日志文件', 3, 0, scanned, found)
+            await scanDirectoryForFilesAsync(
+              base,
+              ['.log'],
+              'program_files',
+              'program_logs',
+              '应用程序日志文件',
+              3,
+              0,
+              scanned,
+              found,
+              yieldCounter
+            )
           )
+          await yieldEventLoop()
         }
         return items
       }
@@ -841,8 +926,8 @@ function buildScanTasks(): ScanTask[] {
       category: 'program_files',
       subCategory: 'program_cache',
       description: '扫描应用程序缓存...',
-      scanFn: () => {
-        return scanDirectoryPatterns(
+      scanFn: async () => {
+        return scanDirectoryPatternsAsync(
           PROGRAMDATA,
           ['cache', 'caches', 'temp'],
           'program_files',
@@ -850,7 +935,8 @@ function buildScanTasks(): ScanTask[] {
           'ProgramData应用缓存',
           true,
           scanned,
-          found
+          found,
+          yieldCounter
         )
       }
     },
@@ -858,13 +944,14 @@ function buildScanTasks(): ScanTask[] {
       category: 'program_files',
       subCategory: 'uninstall_residual',
       description: '扫描卸载残留...',
-      scanFn: () => {
+      scanFn: async () => {
         const items: ScanItem[] = []
         for (const base of [PROGRAMFILES, PROGRAMFILES_X86, PROGRAMDATA]) {
           if (fs.existsSync(base)) {
             const entries = safeReaddir(base)
-            for (const entry of entries) {
+            for (let i = 0; i < entries.length; i++) {
               if (isCancelled) break
+              const entry = entries[i]
               const full = path.join(base, entry)
               const stat = safeStat(full)
               if (stat && stat.isDirectory()) {
@@ -879,8 +966,15 @@ function buildScanTasks(): ScanTask[] {
                 }
               }
               scanned.count++
+              yieldCounter.count++
+              if (yieldCounter.count >= YIELD_INTERVAL) {
+                yieldCounter.count = 0
+                reportProgress(full, 0, scanned.count, found.count)
+                await yieldEventLoop()
+              }
             }
           }
+          await yieldEventLoop()
         }
         return items
       }
@@ -889,14 +983,36 @@ function buildScanTasks(): ScanTask[] {
       category: 'backup_fragment',
       subCategory: 'old_backups',
       description: '扫描废弃备份文件...',
-      scanFn: () => {
+      scanFn: async () => {
         const backupExts = ['.bak', '.backup', '.old', '.tmp', '.orig', '.~']
         let items: ScanItem[] = []
         items = items.concat(
-          scanDirectoryForFiles(APPDATA, backupExts, 'backup_fragment', 'old_backups', '备份/临时文件', 4, 0, scanned, found)
+          await scanDirectoryForFilesAsync(
+            APPDATA,
+            backupExts,
+            'backup_fragment',
+            'old_backups',
+            '备份/临时文件',
+            4,
+            0,
+            scanned,
+            found,
+            yieldCounter
+          )
         )
         items = items.concat(
-          scanDirectoryForFiles(LOCALAPPDATA, backupExts, 'backup_fragment', 'old_backups', '备份/临时文件', 4, 0, scanned, found)
+          await scanDirectoryForFilesAsync(
+            LOCALAPPDATA,
+            backupExts,
+            'backup_fragment',
+            'old_backups',
+            '备份/临时文件',
+            4,
+            0,
+            scanned,
+            found,
+            yieldCounter
+          )
         )
         return items
       }
@@ -905,13 +1021,13 @@ function buildScanTasks(): ScanTask[] {
       category: 'backup_fragment',
       subCategory: 'installer_temp',
       description: '扫描安装临时文件...',
-      scanFn: () => {
+      scanFn: async () => {
         const installPatterns = ['$', 'msiexec', 'install', 'setup']
         let items: ScanItem[] = []
         const tempDir = process.env.TEMP || path.join(LOCALAPPDATA, 'Temp')
         if (fs.existsSync(tempDir)) {
           items = items.concat(
-            scanDirectoryPatterns(
+            await scanDirectoryPatternsAsync(
               tempDir,
               installPatterns,
               'backup_fragment',
@@ -919,13 +1035,15 @@ function buildScanTasks(): ScanTask[] {
               '软件安装临时解压文件',
               true,
               scanned,
-              found
+              found,
+              yieldCounter
             )
           )
         }
         const msiCache = path.join(WINDIR, 'Installer', '$PatchCache$')
-        items = items.concat(addExistingDirectory(msiCache, 'backup_fragment', 'installer_temp', 'MSI补丁缓存'))
-        found.count += items.filter((i) => !items.includes(i)).length
+        items = items.concat(
+          addExistingDirectorySync(msiCache, 'backup_fragment', 'installer_temp', 'MSI补丁缓存', found)
+        )
         return items
       }
     },
@@ -933,7 +1051,7 @@ function buildScanTasks(): ScanTask[] {
       category: 'backup_fragment',
       subCategory: 'download_cache',
       description: '扫描下载缓存...',
-      scanFn: () => {
+      scanFn: async () => {
         const downloadDirs = [
           path.join(HOME, 'Downloads', '.cache'),
           path.join(APPDATA, 'Thunder', 'Profiles'),
@@ -941,11 +1059,12 @@ function buildScanTasks(): ScanTask[] {
           path.join(LOCALAPPDATA, 'Microsoft', 'Windows', 'INetCache'),
           path.join(LOCALAPPDATA, 'Microsoft', 'Windows', 'Temporary Internet Files')
         ]
-        let items: ScanItem[] = []
+        const items: ScanItem[] = []
         for (const d of downloadDirs) {
-          items.push(...addExistingDirectory(d, 'backup_fragment', 'download_cache', '下载缓存/浏览器下载临时文件'))
+          items.push(
+            ...addExistingDirectorySync(d, 'backup_fragment', 'download_cache', '下载缓存/浏览器下载临时文件', found)
+          )
         }
-        found.count += items.length
         return items
       }
     }
@@ -955,24 +1074,29 @@ function buildScanTasks(): ScanTask[] {
 export async function runScan(): Promise<Map<string, Map<string, ScanItem[]>>> {
   isCancelled = false
   const results = new Map<string, Map<string, ScanItem[]>>()
-  const tasks = buildScanTasks()
+  const scanned = { count: 0 }
+  const found = { count: 0 }
+  const tasks = buildAsyncScanTasks(scanned, found)
   const totalTasks = tasks.length
 
   for (let i = 0; i < tasks.length; i++) {
     if (isCancelled) break
     const task = tasks[i]
-    reportProgress(task.description, Math.floor((i / totalTasks) * 100), 0, 0)
+    reportProgress(task.description, Math.floor((i / totalTasks) * 100), scanned.count, found.count)
+    await yieldEventLoop()
 
-    const items = task.scanFn()
+    const items = await task.scanFn()
 
     if (!results.has(task.category)) {
       results.set(task.category, new Map())
     }
     const subMap = results.get(task.category)!
     subMap.set(task.subCategory, items)
+
+    reportProgress(task.description, Math.floor(((i + 1) / totalTasks) * 100), scanned.count, found.count)
   }
 
-  reportProgress('扫描完成', 100, 0, 0)
+  reportProgress('扫描完成', 100, scanned.count, found.count)
   return results
 }
 

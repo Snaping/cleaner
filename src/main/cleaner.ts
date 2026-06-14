@@ -2,6 +2,8 @@ import * as fs from 'fs'
 import * as path from 'path'
 import type { CleanProgress, CleanResult, ScanItem } from './types'
 
+const YIELD_INTERVAL = 30
+
 let cleanProgressCallback: ((progress: CleanProgress) => void) | null = null
 let isCleaningCancelled = false
 
@@ -26,63 +28,49 @@ function reportCleanProgress(
   }
 }
 
-function safeDeleteFile(filePath: string): boolean {
+function yieldEventLoop(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve))
+}
+
+function safeReaddir(dirPath: string): string[] {
   try {
-    if (fs.existsSync(filePath)) {
-      const stat = fs.statSync(filePath)
-      if (stat.isFile()) {
-        fs.unlinkSync(filePath)
-      } else if (stat.isDirectory()) {
-        deleteDirectoryRecursive(filePath)
-      }
-      return true
-    }
-    return true
+    return fs.readdirSync(dirPath)
   } catch {
-    return false
+    return []
   }
 }
 
-function deleteDirectoryRecursive(dirPath: string): void {
-  if (!fs.existsSync(dirPath)) return
+function safeStat(filePath: string): fs.Stats | null {
   try {
-    const entries = fs.readdirSync(dirPath)
-    for (const entry of entries) {
-      const fullPath = path.join(dirPath, entry)
-      try {
-        const stat = fs.statSync(fullPath)
-        if (stat.isDirectory()) {
-          deleteDirectoryRecursive(fullPath)
-        } else {
-          fs.unlinkSync(fullPath)
-        }
-      } catch {
-        continue
-      }
-    }
-    try {
-      fs.rmdirSync(dirPath)
-    } catch {
-      // ignore rmdir errors if not empty
-    }
+    return fs.statSync(filePath)
   } catch {
-    // ignore readdir errors
+    return null
   }
 }
 
-function getFileOrDirSize(targetPath: string): number {
+async function getFileOrDirSizeAsync(
+  targetPath: string,
+  yieldCounter: { count: number }
+): Promise<number> {
   try {
     if (!fs.existsSync(targetPath)) return 0
-    const stat = fs.statSync(targetPath)
+    const stat = safeStat(targetPath)
+    if (!stat) return 0
     if (stat.isFile()) return stat.size
     if (stat.isDirectory()) {
       let size = 0
-      const entries = fs.readdirSync(targetPath)
+      const entries = safeReaddir(targetPath)
       for (const entry of entries) {
+        if (isCleaningCancelled) break
         try {
-          size += getFileOrDirSize(path.join(targetPath, entry))
+          size += await getFileOrDirSizeAsync(path.join(targetPath, entry), yieldCounter)
         } catch {
           continue
+        }
+        yieldCounter.count++
+        if (yieldCounter.count >= YIELD_INTERVAL) {
+          yieldCounter.count = 0
+          await yieldEventLoop()
         }
       }
       return size
@@ -93,12 +81,74 @@ function getFileOrDirSize(targetPath: string): number {
   return 0
 }
 
+async function deleteDirectoryRecursiveAsync(
+  dirPath: string,
+  yieldCounter: { count: number }
+): Promise<boolean> {
+  if (!fs.existsSync(dirPath)) return true
+  try {
+    const entries = safeReaddir(dirPath)
+    for (const entry of entries) {
+      if (isCleaningCancelled) break
+      const fullPath = path.join(dirPath, entry)
+      try {
+        const stat = safeStat(fullPath)
+        if (stat) {
+          if (stat.isDirectory()) {
+            await deleteDirectoryRecursiveAsync(fullPath, yieldCounter)
+          } else {
+            fs.unlinkSync(fullPath)
+          }
+        }
+      } catch {
+        continue
+      }
+      yieldCounter.count++
+      if (yieldCounter.count >= YIELD_INTERVAL) {
+        yieldCounter.count = 0
+        await yieldEventLoop()
+      }
+    }
+    try {
+      fs.rmdirSync(dirPath)
+    } catch {
+      // ignore rmdir errors if not empty
+    }
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function safeDeleteFileAsync(
+  filePath: string,
+  yieldCounter: { count: number }
+): Promise<boolean> {
+  try {
+    if (fs.existsSync(filePath)) {
+      const stat = safeStat(filePath)
+      if (stat) {
+        if (stat.isFile()) {
+          fs.unlinkSync(filePath)
+        } else if (stat.isDirectory()) {
+          await deleteDirectoryRecursiveAsync(filePath, yieldCounter)
+        }
+      }
+      return true
+    }
+    return true
+  } catch {
+    return false
+  }
+}
+
 export async function runClean(items: ScanItem[]): Promise<CleanResult> {
   isCleaningCancelled = false
   const totalItems = items.length
   let cleanedCount = 0
   let totalFreed = 0
   const failedItems: string[] = []
+  const yieldCounter = { count: 0 }
 
   for (let i = 0; i < items.length; i++) {
     if (isCleaningCancelled) break
@@ -106,8 +156,8 @@ export async function runClean(items: ScanItem[]): Promise<CleanResult> {
 
     reportCleanProgress(item.path, Math.floor(((i + 1) / totalItems) * 100), cleanedCount, totalItems, totalFreed, failedItems)
 
-    const sizeBefore = getFileOrDirSize(item.path)
-    const success = safeDeleteFile(item.path)
+    const sizeBefore = await getFileOrDirSizeAsync(item.path, yieldCounter)
+    const success = await safeDeleteFileAsync(item.path, yieldCounter)
 
     if (success) {
       cleanedCount++
@@ -116,8 +166,11 @@ export async function runClean(items: ScanItem[]): Promise<CleanResult> {
       failedItems.push(item.path)
     }
 
-    // Small delay to allow UI updates
-    await new Promise((resolve) => setTimeout(resolve, 10))
+    yieldCounter.count++
+    if (yieldCounter.count >= YIELD_INTERVAL) {
+      yieldCounter.count = 0
+      await yieldEventLoop()
+    }
   }
 
   reportCleanProgress('清理完成', 100, cleanedCount, totalItems, totalFreed, failedItems)
