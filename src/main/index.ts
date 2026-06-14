@@ -5,6 +5,7 @@ import icon from '../../resources/icon.png?asset'
 import * as sudo from 'sudo-prompt'
 import * as fs from 'fs'
 import * as os from 'os'
+import { cancelCleaning } from './cleaner'
 
 import {
   runScan,
@@ -21,6 +22,8 @@ import type { ScanItem, CleanResult, ScanCategory } from './types'
 
 let mainWindow: BrowserWindow | null = null
 let currentScanResults: Map<string, Map<string, ScanItem[]>> = new Map()
+let cleanCancelledFlag = { cancelled: false }
+let elevatedCleanResolve: ((value: CleanResult) => void) | null = null
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -190,39 +193,19 @@ function setupIpcHandlers(): void {
 
     const elevatedResult: CleanResult = await new Promise((resolve) => {
       const command = `powershell -ExecutionPolicy Bypass -File "${tempScriptPath}"`
+      elevatedCleanResolve = resolve
+      cleanCancelledFlag.cancelled = false
 
       let progressInterval: ReturnType<typeof setInterval> | null = null
+      let timeoutTimer: ReturnType<typeof setTimeout> | null = null
       let simulatedPercent = 0
+      let elapsedSeconds = 0
+      const MAX_WAIT_SECONDS = 90
+      const PROGRESS_INTERVAL_MS = 500
+      const PROGRESS_CAP = 99
 
-      progressInterval = setInterval(() => {
-        simulatedPercent = Math.min(simulatedPercent + 2, 95)
-        reportProgress(`正在以管理员权限清理系统文件... (${simulatedPercent}%)`, simulatedPercent)
-      }, 500)
-
-      sudo.exec(command, { name: 'PC Deep Cleaner' }, (error, stdout, stderr) => {
-        if (progressInterval) clearInterval(progressInterval)
-        try {
-          fs.unlinkSync(tempScriptPath)
-        } catch {
-          // ignore
-        }
-
-        if (error) {
-          dialog.showErrorBox(
-            '权限提升失败',
-            `无法以管理员权限执行清理操作: ${error.message}\n未获得权限的文件将保留，您可以手动以管理员身份重新运行程序。`
-          )
-          resolve({
-            success: false,
-            totalFreed: 0,
-            cleanedCount: 0,
-            failedCount: elevatedItems.length,
-            failedItems: elevatedItems.map((i) => i.path)
-          })
-          return
-        }
-
-        const output = (stdout as string) + (stderr as string)
+      const parseSudoOutput = (stdout: string, stderr: string): CleanResult => {
+        const output = stdout + stderr
         const deleted = output.match(/DELETED:/g)?.length || 0
         const failed = output.match(/FAILED:/g)?.length || 0
         const failedLines = output
@@ -242,13 +225,97 @@ function setupIpcHandlers(): void {
           }
         }
 
-        resolve({
-          success: failed === 0,
+        return {
+          success: failed === 0 && !cleanCancelledFlag.cancelled,
           totalFreed: estimatedFreed,
           cleanedCount: deleted,
-          failedCount: failed,
-          failedItems: failedLines
-        })
+          failedCount: cleanCancelledFlag.cancelled
+            ? elevatedItems.length - deleted
+            : failed,
+          failedItems: cleanCancelledFlag.cancelled
+            ? [...failedLines, ...elevatedItems.filter((i) => !deletedPaths.some((p) => i.path.startsWith(p) || p.startsWith(i.path))).map((i) => i.path)].slice(0, 50)
+            : failedLines
+        }
+      }
+
+      const cleanupAndResolve = (result: CleanResult): void => {
+        if (progressInterval) {
+          clearInterval(progressInterval)
+          progressInterval = null
+        }
+        if (timeoutTimer) {
+          clearTimeout(timeoutTimer)
+          timeoutTimer = null
+        }
+        elevatedCleanResolve = null
+        try {
+          fs.unlinkSync(tempScriptPath)
+        } catch {
+          // ignore
+        }
+        resolve(result)
+      }
+
+      progressInterval = setInterval(() => {
+        elapsedSeconds += PROGRESS_INTERVAL_MS / 1000
+        const remaining = PROGRESS_CAP - simulatedPercent
+        const increment = Math.max(0.3, remaining * 0.03)
+        simulatedPercent = Math.min(simulatedPercent + increment, PROGRESS_CAP)
+
+        if (cleanCancelledFlag.cancelled) {
+          reportProgress('用户取消，正在停止...', simulatedPercent)
+          cleanupAndResolve({
+            success: false,
+            totalFreed: 0,
+            cleanedCount: 0,
+            failedCount: elevatedItems.length,
+            failedItems: elevatedItems.map((i) => i.path).slice(0, 50)
+          })
+          return
+        }
+
+        if (simulatedPercent < 50) {
+          reportProgress(`正在以管理员权限清理系统文件... (${simulatedPercent.toFixed(0)}%)`, simulatedPercent)
+        } else if (simulatedPercent < 85) {
+          reportProgress(`正在处理系统保护目录... (${simulatedPercent.toFixed(0)}%)`, simulatedPercent)
+        } else {
+          reportProgress(`清理中，剩余少量文件... (${simulatedPercent.toFixed(0)}%)`, simulatedPercent)
+        }
+      }, PROGRESS_INTERVAL_MS)
+
+      timeoutTimer = setTimeout(() => {
+        reportProgress('清理耗时较长，您可以等待或点击取消继续使用', PROGRESS_CAP)
+      }, MAX_WAIT_SECONDS * 1000)
+
+      sudo.exec(command, { name: 'PC Deep Cleaner' }, (error, stdout, stderr) => {
+        if (cleanCancelledFlag.cancelled) {
+          cleanupAndResolve({
+            success: false,
+            totalFreed: 0,
+            cleanedCount: 0,
+            failedCount: elevatedItems.length,
+            failedItems: elevatedItems.map((i) => i.path).slice(0, 50)
+          })
+          return
+        }
+
+        if (error) {
+          dialog.showErrorBox(
+            '权限提升失败',
+            `无法以管理员权限执行清理操作: ${error.message}\n未获得权限的文件将保留，您可以手动以管理员身份重新运行程序。`
+          )
+          cleanupAndResolve({
+            success: false,
+            totalFreed: 0,
+            cleanedCount: 0,
+            failedCount: elevatedItems.length,
+            failedItems: elevatedItems.map((i) => i.path)
+          })
+          return
+        }
+
+        const result = parseSudoOutput(stdout as string, stderr as string)
+        cleanupAndResolve(result)
       })
     })
 
@@ -280,6 +347,22 @@ function setupIpcHandlers(): void {
       failedCount: 0,
       failedItems: []
     } as CleanResult
+  })
+
+  ipcMain.handle('clean:cancel', async () => {
+    cancelCleaning()
+    cleanCancelledFlag.cancelled = true
+
+    if (elevatedCleanResolve) {
+      elevatedCleanResolve({
+        success: false,
+        totalFreed: 0,
+        cleanedCount: 0,
+        failedCount: 0,
+        failedItems: []
+      })
+    }
+    return true
   })
 }
 

@@ -72,6 +72,8 @@ const api = {
   cleanElevated: (filePaths: string[], allFiles: boolean): Promise<CleanResult> =>
     ipcRenderer.invoke('clean:elevated', filePaths, allFiles),
 
+  cleanCancel: (): Promise<boolean> => ipcRenderer.invoke('clean:cancel'),
+
   onCleanProgress: (callback: (progress: CleanProgress) => void): (() => void) => {
     const listener = (_event: Electron.IpcRendererEvent, progress: CleanProgress): void => callback(progress)
     ipcRenderer.on('clean:progress', listener)

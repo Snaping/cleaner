@@ -225,6 +225,14 @@ const App: React.FC = () => {
     setTimeout(() => handleCleanClick(), 50)
   }
 
+  const handleCancelClean = async (): Promise<void> => {
+    try {
+      await window.api.cleanCancel()
+    } catch (err) {
+      console.error('Cancel failed:', err)
+    }
+  }
+
   const getStatusText = (): string => {
     switch (status) {
       case 'idle':
@@ -290,6 +298,15 @@ const App: React.FC = () => {
             </div>
 
             <div className="toolbar-actions">
+              {status === 'cleaning' && (
+                <button
+                  className="btn btn-secondary"
+                  onClick={handleCancelClean}
+                >
+                  <span className="btn-icon">⛔</span>
+                  取消清理
+                </button>
+              )}
               {status === 'scanned' && getTotalItems() > 0 && (
                 <button className="btn btn-secondary" onClick={handleToggleSelectAll}>
                   <span className="btn-icon">{isAllSelected() ? '☑️' : '⬜'}</span>
